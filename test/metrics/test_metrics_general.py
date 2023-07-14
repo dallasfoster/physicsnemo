@@ -242,8 +242,8 @@ def test_crps(device, rtol: float = 1e-3, atol: float = 1e-3):
     assert torch.allclose(
         c,
         true_crps * torch.ones([1], dtype=torch.float32, device=device),
-        rtol=10*rtol,
-        atol=10*atol,
+        rtol=10 * rtol,
+        atol=10 * atol,
     )
 
     # Test kernel method
@@ -321,29 +321,29 @@ def test_crps(device, rtol: float = 1e-3, atol: float = 1e-3):
         atol=atol,
     )
 
-    # Test different shape 
+    # Test different shape
     x = torch.randn((2, 3, 50, 100), device=device, dtype=torch.float32)
     y = torch.zeros((2, 3, 100), device=device, dtype=torch.float32)
     z = torch.zeros((2, 3, 50), device=device, dtype=torch.float32)
 
-    # Test dim 
-    c = crps.crps(x, y, dim = 2)
+    # Test dim
+    c = crps.crps(x, y, dim=2)
     assert c.shape == y.shape
 
     # Test when input is numpy array
-    c = crps.crps(x, y.cpu().numpy(), dim = 2)
+    c = crps.crps(x, y.cpu().numpy(), dim=2)
     assert c.shape == y.shape
 
-    # Test different dim 
-    c = crps.crps(x, z, dim = 3)
+    # Test different dim
+    c = crps.crps(x, z, dim=3)
     assert c.shape == z.shape
 
     # Test when input is numpy array
-    c = crps.crps(x, z.cpu().numpy(), dim = 3)
+    c = crps.crps(x, z.cpu().numpy(), dim=3)
     assert c.shape == z.shape
 
     # Test kernel method
-    c = crps.kcrps(x, z, dim = 3)
+    c = crps.kcrps(x, z, dim=3)
     true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
     assert c.shape == z.shape
 
@@ -508,7 +508,6 @@ def test_calibration(device, rtol: float = 1e-2, atol: float = 1e-2):
     )
     assert fpr.shape == tpr.shape
     assert fpr.shape == torch.Size([15, 1000])
-
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
