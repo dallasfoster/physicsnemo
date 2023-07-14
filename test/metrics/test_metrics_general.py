@@ -218,7 +218,7 @@ def test_crps(device, rtol: float = 1e-3, atol: float = 1e-3):
     y = torch.zeros((1,), device=device, dtype=torch.float32)
 
     # Test pure crps
-    c = crps.crps(x, y, bins=1_000)
+    c = crps.crps(x, y)
     true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
     assert torch.allclose(
         c,
@@ -228,7 +228,27 @@ def test_crps(device, rtol: float = 1e-3, atol: float = 1e-3):
     )
 
     # Test when input is numpy array
-    c = crps.crps(x, y.cpu().numpy(), bins=1_000)
+    c = crps.crps(x, y.cpu().numpy())
+    assert torch.allclose(
+        c,
+        true_crps * torch.ones([1], dtype=torch.float32, device=device),
+        rtol=rtol,
+        atol=atol,
+    )
+
+    # Test kernel method, use fewer ensemble members
+    c = crps.kcrps(x[:1000], y)
+    true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
+    assert torch.allclose(
+        c,
+        true_crps * torch.ones([1], dtype=torch.float32, device=device),
+        rtol=10*rtol,
+        atol=10*atol,
+    )
+
+    # Test kernel method
+    c = crps.kcrps(x, y)
+    true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
     assert torch.allclose(
         c,
         true_crps * torch.ones([1], dtype=torch.float32, device=device),
@@ -300,6 +320,32 @@ def test_crps(device, rtol: float = 1e-3, atol: float = 1e-3):
         rtol=rtol,
         atol=atol,
     )
+
+    # Test different shape 
+    x = torch.randn((2, 3, 50, 100), device=device, dtype=torch.float32)
+    y = torch.zeros((2, 3, 100), device=device, dtype=torch.float32)
+    z = torch.zeros((2, 3, 50), device=device, dtype=torch.float32)
+
+    # Test dim 
+    c = crps.crps(x, y, dim = 2)
+    assert c.shape == y.shape
+
+    # Test when input is numpy array
+    c = crps.crps(x, y.cpu().numpy(), dim = 2)
+    assert c.shape == y.shape
+
+    # Test different dim 
+    c = crps.crps(x, z, dim = 3)
+    assert c.shape == z.shape
+
+    # Test when input is numpy array
+    c = crps.crps(x, z.cpu().numpy(), dim = 3)
+    assert c.shape == z.shape
+
+    # Test kernel method
+    c = crps.kcrps(x, z, dim = 3)
+    true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
+    assert c.shape == z.shape
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
@@ -443,6 +489,26 @@ def test_calibration(device, rtol: float = 1e-2, atol: float = 1e-2):
     assert torch.allclose(
         rps, torch.zeros([1], device=device, dtype=torch.float32), rtol=rtol, atol=atol
     )
+
+    # Test ROC/AUC
+    x = torch.rand((1000, 100, 100), device=device, dtype=torch.float32)
+    y = 1.0 * (x > 0.75)
+    fpr, tpr = cal.ReceiverOperatorCharacteristic(
+        x, y, thresholds=torch.linspace(0, 1, 11), dim=0
+    )
+    assert fpr.shape == tpr.shape
+    assert fpr.shape == torch.Size([11, 100, 100])
+    auc = torch.trapz(fpr, tpr)
+    assert torch.allclose(auc, cal._auc_from_rates(tpr, fpr))
+    assert torch.all(torch.le(auc, 1.0))
+    assert torch.all(torch.le(fpr, 1.0))
+    assert torch.all(torch.le(tpr, 1.0))
+    fpr, tpr = cal.ReceiverOperatorCharacteristic(
+        x, y, thresholds=torch.linspace(0, 1, 15), dim=(1, 2)
+    )
+    assert fpr.shape == tpr.shape
+    assert fpr.shape == torch.Size([15, 1000])
+
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
