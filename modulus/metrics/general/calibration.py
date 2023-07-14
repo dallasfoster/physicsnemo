@@ -136,3 +136,67 @@ def rank_probability_score(ranks: Tensor) -> Tensor:
     bins = linspace(start, end, 10)
     bin_edges, bin_counts = histogram(ranks, bins=bins)
     return _rank_probability_score_from_counts(bin_edges, bin_counts)
+
+
+def ReceiverOperatorCharacteristic(
+    probs: Tensor,
+    truth: Tensor,
+    thresholds: Tensor = torch.linspace(0, 1, 21),
+    dim: Union[int, tuple] = 0,
+):
+    """
+    Calculate the reciever operator characteristic curve for probabilistic predictions 'probs' for the
+    true categorical label 'truth' given threshold probabilities 'thresholds'.
+
+    Parameters
+    ----------
+    probs : Tensor
+
+    truth : Tensor
+
+    thresholds : Tensor
+
+    Returns
+    -------
+
+    """
+    thresholds = thresholds.to(probs.device)
+    for _ in range(probs.ndim):
+        thresholds = thresholds.unsqueeze(-1)
+    p = probs[None] >= thresholds
+
+    if isinstance(dim, int):
+        dim = [
+            dim,
+        ]
+    broadcast_dims = [d + 1 if d >= 0 else d for d in dim]
+    truepos = torch.logical_and(p, truth[None]).sum(dim=broadcast_dims)
+    falsepos = torch.logical_and(p, 1 - truth[None]).sum(dim=broadcast_dims)
+    totpos = truth.sum(dim=dim)
+    totneg = (1 - truth).sum(dim=dim)
+    tpr = truepos / totpos[None]
+    fpr = falsepos / totneg[None]
+    fpr, inds = torch.sort(fpr, dim=0)
+    tpr = torch.gather(tpr, 0, inds)
+    return fpr, tpr
+
+
+def _auc_from_rates(false_pos_rate: Tensor, true_pos_rate: Tensor):
+    """
+    Calculate the area under the Receiver Operator Characteric (ROC) curve (AUC)
+    using the false positive and true positive rates.
+
+    Parameters
+    ----------
+    true_pos_rate : Tensor
+
+    false_pos_rate : Tensor
+
+    Returns
+    -------
+    auc : Tensor
+        Area underneath the (false_pos_rate, true_pos_rate) curve. Calculated using
+        the trapezoidal rule.
+
+    """
+    return torch.trapz(true_pos_rate, false_pos_rate)
