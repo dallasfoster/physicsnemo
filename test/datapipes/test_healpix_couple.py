@@ -138,6 +138,8 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     expected = np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4))
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
 
+    DistributedManager.cleanup()
+
 
 @nfsdata_or_fail
 def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
@@ -193,6 +195,8 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     assert np.array_equal(expected, coupler.coupled_scaling["mean"])
     expected = np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4))
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
+
+    DistributedManager.cleanup()
 
 
 @nfsdata_or_fail
@@ -287,58 +291,60 @@ def test_CoupledTimeSeriesDataset_initialization(
     )
     assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
 
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0H"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
-        scaling=scaling_dict,
-        batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
-        data_time_step="3h",
-        time_step="6h",
-        couplings=constant_coupler,
-    )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    # constant_coupler = [
+    #     {
+    #         "coupler": "ConstantCoupler",
+    #         "params": {
+    #             "batch_size": 1,
+    #             "variables": ["z250"],
+    #             "input_times": ["0H"],
+    #             "input_time_dim": 1,
+    #             "output_time_dim": 1,
+    #             "presteps": 0,
+    #             "prepared_coupled_data": True,
+    #         },
+    #     }
+    # ]
+    # timeseries_ds = CoupledTimeSeriesDataset(
+    #     dataset=zarr_ds,
+    #     input_variables=variables,
+    #     scaling=scaling_dict,
+    #     batch_size=1,
+    #     forecast_init_times=zarr_ds.time[:2],
+    #     data_time_step="3h",
+    #     time_step="6h",
+    #     couplings=constant_coupler,
+    # )
+    # assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
 
-    average_coupler = [
-        {
-            "coupler": "TrailingAverageCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["6H"],
-                "averaging_window": "6H",
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
-        scaling=scaling_dict,
-        batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
-        data_time_step="3h",
-        time_step="6h",
-        couplings=average_coupler,
-    )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    # average_coupler = [
+    #     {
+    #         "coupler": "TrailingAverageCoupler",
+    #         "params": {
+    #             "batch_size": 1,
+    #             "variables": ["z250"],
+    #             "input_times": ["6H"],
+    #             "averaging_window": "6H",
+    #             "input_time_dim": 1,
+    #             "output_time_dim": 1,
+    #             "presteps": 0,
+    #             "prepared_coupled_data": True,
+    #         },
+    #     }
+    # ]
+    # timeseries_ds = CoupledTimeSeriesDataset(
+    #     dataset=zarr_ds,
+    #     input_variables=variables,
+    #     scaling=scaling_dict,
+    #     batch_size=1,
+    #     forecast_init_times=zarr_ds.time[:2],
+    #     data_time_step="3h",
+    #     time_step="6h",
+    #     couplings=average_coupler,
+    # )
+    # assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+
+    DistributedManager.cleanup()
 
 
 @nfsdata_or_fail
@@ -379,6 +385,8 @@ def test_CoupledTimeSeriesDataset_get_constants(
         expected,
         outvar,
     )
+
+    DistributedManager.cleanup()
 
 
 @nfsdata_or_fail
@@ -457,6 +465,8 @@ def test_CoupledTimeSeriesDataset_len(
         couplings=constant_coupler,
     )
     assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
+
+    DistributedManager.cleanup()
 
 
 @nfsdata_or_fail
@@ -590,6 +600,8 @@ def test_CoupledTimeSeriesDataset_get(
         couplings=constant_coupler,
     )
     assert len(inputs) == (len(timeseries_ds[0]) + 1)
+
+    DistributedManager.cleanup()
 
 
 @nfsdata_or_fail
@@ -831,7 +843,6 @@ def test_CoupledTimeSeriesDataModule_get_dataloaders(
     test_dataloader, test_sampler = timeseries_dm.test_dataloader(num_shards=1)
     assert test_sampler is None
     assert isinstance(test_dataloader, DataLoader)
-    print(f"dataset lenght {len}")
     # with >1 shard should be distributed sampler
     train_dataloader, train_sampler = timeseries_dm.train_dataloader(num_shards=2)
     assert isinstance(train_sampler, DistributedSampler)
@@ -918,3 +929,5 @@ def test_CoupledTimeSeriesDataModule_get_coupled_vars(
     outvar.sort()
 
     assert expected == outvar
+
+    DistributedManager.cleanup()

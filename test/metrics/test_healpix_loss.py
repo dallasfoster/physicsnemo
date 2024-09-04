@@ -227,7 +227,13 @@ def dataset_name():
 @nfsdata_or_fail
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_OceanMSE(
-    data_dir, dataset_name, device, test_data, rtol: float = 1e-3, atol: float = 1e-3
+    data_dir,
+    dataset_name,
+    device,
+    test_data,
+    pytestconfig,
+    rtol: float = 1e-3,
+    atol: float = 1e-3,
 ):
     num_channels = 3
     channels, pred_tensor_np, targ_tensor_np = test_data(
