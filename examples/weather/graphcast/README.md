@@ -65,7 +65,7 @@ You will need a Globus account and will need to be logged in to your account in 
 to access the data. You may also need the [Globus Connect](https://www.globus.org/globus-connect)
 to transfer data.
 
-Note: While this pre-curated dataset is convenient, it contains fewer channels than 
+Note: While this pre-curated dataset is convenient, it contains fewer channels than
 the full GraphCast model uses. For the complete model implementation, we recommend
 using Option 1 to download the full set of required variables.
 
@@ -98,16 +98,16 @@ the model architecture. The above image is taken from the reference paper.
 
 1. Install PhysicsNeMo with required extras:
 
-```bash
-# If installing from the PhysicsNeMo repository
-pip install .[launch]
-```
+    ```bash
+    # If installing from the PhysicsNeMo repository
+    pip install .[launch]
+    ```
 
 2. Install additional dependencies:
 
-```bash
-pip install -r requirements.txt
-```
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 ### Training
 
