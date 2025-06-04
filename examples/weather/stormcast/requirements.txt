@@ -1,2 +1,4 @@
 pyproj
-
+hydra-core
+wandb
+glob
