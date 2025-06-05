@@ -14,25 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dgl
 import pytest
 import torch
 from models.common import validate_forward_accuracy
 from pytest_utils import import_or_fail
 
-from modulus.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
+dgl = pytest.importorskip("dgl")
 
 
 @pytest.fixture
-def ahmed_data_dir():
-    path = "/data/nfs/modulus-data/datasets/ahmed_body/"
-    return path
+def ahmed_data_dir(nfs_data_dir):
+    return nfs_data_dir.joinpath("datasets/ahmed_body")
 
 
-@import_or_fail("sparse_dot_mkl")
+@import_or_fail(["sparse_dot_mkl", "dgl"])
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_bsms_mgn_forward(pytestconfig, device):
-    from modulus.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 
     torch.manual_seed(1)
 
@@ -89,10 +88,11 @@ def test_bsms_mgn_forward(pytestconfig, device):
     )
 
 
-@import_or_fail("sparse_dot_mkl")
+@import_or_fail(["sparse_dot_mkl", "dgl"])
 def test_bsms_mgn_ahmed(pytestconfig, ahmed_data_dir):
-    from modulus.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
-    from modulus.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
+    from physicsnemo.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.models.meshgraphnet.bsms_mgn import BiStrideMeshGraphNet
 
     device = torch.device("cuda:0")
 

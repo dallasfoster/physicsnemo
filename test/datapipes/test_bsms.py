@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dgl
 import pytest
 import torch
 from pytest_utils import import_or_fail
 
+dgl = pytest.importorskip("dgl")
+
 
 @pytest.fixture
-def ahmed_data_dir():
-    path = "/data/nfs/modulus-data/datasets/ahmed_body/"
-    return path
+def ahmed_data_dir(nfs_data_dir):
+    return nfs_data_dir.joinpath("datasets/ahmed_body")
 
 
 @import_or_fail("sparse_dot_mkl")
 def test_bsms_init(pytestconfig):
-    from modulus.datapipes.gnn.bsms import BistrideMultiLayerGraph
+    from physicsnemo.datapipes.gnn.bsms import BistrideMultiLayerGraph
 
     torch.manual_seed(1)
 
@@ -59,8 +59,8 @@ def test_bsms_init(pytestconfig):
 
 @import_or_fail("sparse_dot_mkl")
 def test_bsms_ahmed_dataset(pytestconfig, ahmed_data_dir):
-    from modulus.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
-    from modulus.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
+    from physicsnemo.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
 
     split = "train"
     # Construct multi-scale dataset out of standard Ahmed Body dataset.
@@ -86,8 +86,8 @@ def test_bsms_ahmed_dataset(pytestconfig, ahmed_data_dir):
 
 @import_or_fail("sparse_dot_mkl")
 def test_bsms_ahmed_dataset_caching(pytestconfig, ahmed_data_dir, tmp_path):
-    from modulus.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
-    from modulus.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
+    from physicsnemo.datapipes.gnn.ahmed_body_dataset import AhmedBodyDataset
+    from physicsnemo.datapipes.gnn.bsms import BistrideMultiLayerGraphDataset
 
     split = "train"
     # Construct multi-scale dataset out of standard Ahmed Body dataset.

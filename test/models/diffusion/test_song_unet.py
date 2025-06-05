@@ -25,7 +25,7 @@ sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
 
 import common
 
-from modulus.models.diffusion import SongUNet as UNet
+from physicsnemo.models.diffusion import SongUNet as UNet
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
@@ -82,6 +82,26 @@ def test_song_unet_constructor(device):
     input_image = torch.ones([1, 2, 16, 16]).to(device)
     output_image = model(input_image, noise_labels, class_labels)
     assert output_image.shape == (1, out_channels, img_resolution, img_resolution)
+
+    # DDM++ with additive pos embed
+    model_channels = 64
+    model = UNet(
+        img_resolution=img_resolution,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        model_channels=model_channels,
+        additive_pos_embed=True,
+    ).to(device)
+    noise_labels = torch.randn([1]).to(device)
+    class_labels = torch.randint(0, 1, (1, 1)).to(device)
+    input_image = torch.ones([1, 2, 16, 16]).to(device)
+    output_image = model(input_image, noise_labels, class_labels)
+    assert model.spatial_emb.shape == (
+        1,
+        model_channels,
+        img_resolution,
+        img_resolution,
+    )
 
     # NCSN++
     model = UNet(
@@ -186,6 +206,14 @@ def test_song_unet_optims(device):
     model, invar = setup_model()
     assert common.validate_combo_optims(model, (*invar,))
 
+    # Check fullgraph compilation
+    # run only on GPU
+    if device == "cuda:0":
+        model, invar = setup_model()
+        assert common.validate_torch_compile(
+            model, (*invar,), fullgraph=True, error_on_recompile=True
+        )
+
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_song_unet_checkpoint(device):
@@ -213,7 +241,7 @@ def test_song_unet_checkpoint(device):
 
 @common.check_ort_version()
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-def test_son_unet_deploy(device):
+def test_song_unet_deploy(device):
     """Test Song UNet deployment support"""
     model = UNet(
         img_resolution=16,

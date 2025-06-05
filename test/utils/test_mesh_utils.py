@@ -21,14 +21,8 @@ import urllib
 import numpy as np
 import pytest
 from pytest_utils import import_or_fail
-from stl import mesh
 
-from modulus.utils.mesh import (
-    combine_vtp_files,
-    convert_tesselated_files_in_directory,
-    sdf_to_stl,
-)
-from modulus.utils.sdf import signed_distance_field
+stl = pytest.importorskip("stl")
 
 
 @pytest.fixture
@@ -48,11 +42,16 @@ def download_stl(tmp_path):
     return file_path
 
 
-@import_or_fail(["vtk"])
+@import_or_fail(["vtk", "warp"])
 def test_mesh_utils(tmp_path, pytestconfig):
     """Tests the utility for combining VTP files and converting tesselated files."""
 
     import vtk
+
+    from physicsnemo.utils.mesh import (
+        combine_vtp_files,
+        convert_tesselated_files_in_directory,
+    )
 
     def _create_random_vtp_mesh(num_points: int, num_triangles: int, dir: str) -> tuple:
         """
@@ -181,6 +180,13 @@ def test_mesh_utils(tmp_path, pytestconfig):
 @pytest.mark.parametrize("backend", ["warp", "skimage"])
 def test_stl_gen(pytestconfig, backend, download_stl, tmp_path):
 
+    from stl import mesh
+
+    from physicsnemo.utils.mesh import (
+        sdf_to_stl,
+    )
+    from physicsnemo.utils.sdf import signed_distance_field
+
     bunny_mesh = mesh.Mesh.from_file(str(download_stl))
 
     vertices = np.array(bunny_mesh.vectors, dtype=np.float64)
@@ -205,9 +211,7 @@ def test_stl_gen(pytestconfig, backend, download_stl, tmp_path):
         [xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], axis=1
     )
 
-    sdf_test = signed_distance_field(
-        vertices_3d, vert_indices, coords.flatten()
-    ).numpy()
+    sdf_test = signed_distance_field(vertices_3d, vert_indices, coords.flatten())
     output_filename = tmp_path / "output_stl.stl"
     sdf_to_stl(
         sdf_test.reshape(n[0], n[1], n[2]),

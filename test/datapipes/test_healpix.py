@@ -19,28 +19,21 @@ import shutil
 import warnings
 from pathlib import Path
 
-import numpy as np
 import pytest
-import xarray as xr
-from omegaconf import DictConfig
-from pytest_utils import nfsdata_or_fail
+from pytest_utils import import_or_fail
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from modulus.datapipes.healpix.data_modules import (
-    TimeSeriesDataModule,
-    create_time_series_dataset_classic,
-    open_time_series_dataset_classic_on_the_fly,
-    open_time_series_dataset_classic_prebuilt,
-)
-from modulus.datapipes.healpix.timeseries_dataset import TimeSeriesDataset
-from modulus.distributed import DistributedManager
+from physicsnemo.distributed import DistributedManager
+
+omegaconf = pytest.importorskip("omegaconf")
+np = pytest.importorskip("numpy")
+xr = pytest.importorskip("xarray")
 
 
 @pytest.fixture
-def data_dir():
-    path = "/data/nfs/modulus-data/datasets/healpix/"
-    return path
+def data_dir(nfs_data_dir):
+    return nfs_data_dir.joinpath("datasets/healpix")
 
 
 @pytest.fixture
@@ -50,9 +43,8 @@ def dataset_name():
 
 
 @pytest.fixture
-def create_path():
-    path = "/data/nfs/modulus-data/datasets/healpix/merge"
-    return path
+def create_path(nfs_data_dir):
+    return nfs_data_dir.joinpath("datasets/healpix/merge")
 
 
 def delete_dataset(create_path, dataset_name):
@@ -72,9 +64,12 @@ def scaling_dict():
         "z1000": {"mean": 952.1435546875, "std": 895.7516479492188},
         "z250": {"mean": 101186.28125, "std": 5551.77978515625},
         "z500": {"mean": 55625.9609375, "std": 2681.712890625},
+        "lsm": {"mean": 0, "std": 1},
+        "z": {"mean": 0, "std": 1},
         "tp6": {"mean": 1, "std": 0, "log_epsilon": 1e-6},
+        "extra": {"mean": 1, "std": 0},  # doesn't appear in test dataset
     }
-    return DictConfig(scaling)
+    return omegaconf.DictConfig(scaling)
 
 
 @pytest.fixture
@@ -88,12 +83,20 @@ def scaling_double_dict():
         "z250": {"mean": 0, "std": 2},
         "z500": {"mean": 0, "std": 2},
         "tp6": {"mean": 0, "std": 2, "log_epsilon": 1e-6},
+        "lsm": {"mean": 0, "std": 2},
+        "z": {"mean": 0, "std": 2},
+        "extra": {"mean": 0, "std": 2},  # doesn't appear in test dataset
     }
-    return DictConfig(scaling)
+    return omegaconf.DictConfig(scaling)
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
 def test_open_time_series_on_the_fly(create_path, pytestconfig):
+    from physicsnemo.datapipes.healpix.data_modules import (
+        open_time_series_dataset_classic_on_the_fly,
+    )
+
     variables = ["z500", "z1000"]
     constants = {"lsm": "lsm"}
 
@@ -106,24 +109,38 @@ def test_open_time_series_on_the_fly(create_path, pytestconfig):
     assert isinstance(ds, xr.Dataset)
 
     test_var = variables[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
+    base = xr.open_dataset(str(create_path.joinpath(f"{test_var}.nc")))
     ds_var = ds.inputs.sel(channel_in=test_var)
 
     assert ds_var.equals(base[test_var])
+    ds.close()
+    base.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
 def test_open_time_series(data_dir, dataset_name, pytestconfig):
     # check for failure of non-existant dataset
+    from physicsnemo.datapipes.healpix.data_modules import (
+        open_time_series_dataset_classic_prebuilt,
+    )
+
     with pytest.raises(FileNotFoundError, match=("Dataset doesn't appear to exist at")):
         open_time_series_dataset_classic_prebuilt("/null_path", dataset_name)
 
     ds = open_time_series_dataset_classic_prebuilt(data_dir, dataset_name)
     assert isinstance(ds, xr.Dataset)
+    ds.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("numpy")
 def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
+
+    from physicsnemo.datapipes.healpix.data_modules import (
+        create_time_series_dataset_classic,
+    )
+
     variables = ["z500", "z1000"]
     constants = {"lsm": "lsm"}
     scaling = {"z500": {"log_epsilon": 2}}
@@ -135,11 +152,12 @@ def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
         input_variables=["null", "null"],
     )
     assert isinstance(ds, xr.Dataset)
+    ds.close()
 
     # create new dataset
     # open a base dataset to compare against
     test_var = list(scaling.keys())[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
+    base = xr.open_dataset(str(create_path.joinpath(f"{test_var}.nc")))
     # scale our test variable
     base[test_var] = np.log(base[test_var] + scaling[test_var]["log_epsilon"]) - np.log(
         scaling[test_var]["log_epsilon"]
@@ -154,13 +172,15 @@ def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
     ds_var = ds.inputs.sel(channel_in=test_var)
 
     assert ds_var.equals(base[test_var])
+    ds.close()
+    base.close()
 
     # delete the created file so we have a clean test for next time
     delete_dataset(create_path, dataset_name)
 
     # and with constants
     const = list(constants.keys())[0]
-    const_ds = xr.open_dataset(create_path + "/" + const + ".nc")
+    const_ds = xr.open_dataset(str(create_path.joinpath(f"{const}.nc")))
     ds = create_time_series_dataset_classic(
         src_directory=create_path,
         dst_directory=create_path,
@@ -170,15 +190,21 @@ def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
         constants=constants,
     )
     assert (const_ds[const] == ds.constants[0]).any()
+    ds.close()
+    const_ds.close()
 
     # delete the created file so we have a clean test for next time
     delete_dataset(create_path, dataset_name)
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
 def test_TimeSeriesDataset_initialization(
     data_dir, dataset_name, scaling_dict, pytestconfig
 ):
+
+    from physicsnemo.datapipes.healpix.timeseries_dataset import TimeSeriesDataset
+
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
@@ -207,12 +233,12 @@ def test_TimeSeriesDataset_initialization(
         )
 
     # check for failure of invalid scaling variable on input
-    invalid_scaling = DictConfig(
+    invalid_scaling = omegaconf.DictConfig(
         {
             "bogosity": {"mean": 0, "std": 42},
         }
     )
-    with pytest.raises(KeyError, match=("one or more of the input data variables")):
+    with pytest.raises(KeyError, match=("Input channels ")):
         timeseries_ds = TimeSeriesDataset(
             dataset=zarr_ds,
             data_time_step="3h",
@@ -264,12 +290,17 @@ def test_TimeSeriesDataset_initialization(
         time_step="6h",
     )
     assert isinstance(timeseries_ds, TimeSeriesDataset)
+    zarr_ds.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("numpy")
 def test_TimeSeriesDataset_get_constants(
     data_dir, dataset_name, scaling_dict, pytestconfig
 ):
+    from physicsnemo.datapipes.healpix.timeseries_dataset import TimeSeriesDataset
+
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
@@ -286,10 +317,14 @@ def test_TimeSeriesDataset_get_constants(
         expected,
         outvar,
     )
+    zarr_ds.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
 def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfig):
+    from physicsnemo.datapipes.healpix.timeseries_dataset import TimeSeriesDataset
+
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
@@ -325,12 +360,17 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
         drop_last=True,
     )
     assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
+    zarr_ds.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("numpy")
 def test_TimeSeriesDataset_get(
     data_dir, dataset_name, scaling_double_dict, pytestconfig
 ):
+    from physicsnemo.datapipes.healpix.timeseries_dataset import TimeSeriesDataset
+
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
@@ -430,12 +470,18 @@ def test_TimeSeriesDataset_get(
         forecast_init_times=zarr_ds.time[:init_times],
     )
     assert len(inputs) == (len(timeseries_ds[0]) + 1)
+    zarr_ds.close()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
 def test_TimeSeriesDataModule_initialization(
     data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
 ):
+    from physicsnemo.datapipes.healpix.data_modules import (
+        TimeSeriesDataModule,
+    )
+
     variables = ["z500", "z1000"]
     splits = {
         "train_date_start": "1959-01-01",
@@ -507,16 +553,23 @@ def test_TimeSeriesDataModule_initialization(
         batch_size=1,
         prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        splits=DictConfig(splits),
+        splits=omegaconf.DictConfig(splits),
     )
     assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    zarr_ds.close()
     DistributedManager.cleanup()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("numpy")
 def test_TimeSeriesDataModule_get_constants(
     data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
 ):
+    from physicsnemo.datapipes.healpix.data_modules import (
+        TimeSeriesDataModule,
+    )
+
     variables = ["z500", "z1000"]
     constants = {"lsm": "lsm"}
 
@@ -550,7 +603,15 @@ def test_TimeSeriesDataModule_get_constants(
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
-    expected = np.transpose(zarr_ds.constants.values, axes=(1, 0, 2, 3))
+
+    # dividing by 2 due to scaling
+    expected = (
+        np.transpose(
+            zarr_ds.constants.sel(channel_c=list(constants.keys())).values,
+            axes=(1, 0, 2, 3),
+        )
+        / 2.0
+    )
 
     assert np.array_equal(
         timeseries_dm.get_constants(),
@@ -574,13 +635,19 @@ def test_TimeSeriesDataModule_get_constants(
         timeseries_dm.get_constants(),
         expected,
     )
+    zarr_ds.close()
     DistributedManager.cleanup()
 
 
-@nfsdata_or_fail
+@import_or_fail("omegaconf")
 def test_TimeSeriesDataModule_get_dataloaders(
     data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
 ):
+
+    from physicsnemo.datapipes.healpix.data_modules import (
+        TimeSeriesDataModule,
+    )
+
     variables = ["z500", "z1000"]
     splits = {
         "train_date_start": "1979-01-01",
@@ -617,7 +684,7 @@ def test_TimeSeriesDataModule_get_dataloaders(
     test_dataloader, test_sampler = timeseries_dm.test_dataloader(num_shards=1)
     assert test_sampler is None
     assert isinstance(test_dataloader, DataLoader)
-    print(f"dataset lenght {len}")
+
     # with >1 shard should be distributed sampler
     train_dataloader, train_sampler = timeseries_dm.train_dataloader(num_shards=2)
     assert isinstance(train_sampler, DistributedSampler)

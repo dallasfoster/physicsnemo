@@ -19,7 +19,7 @@ import random
 import pytest
 import torch
 
-from modulus.models.fno import FNO
+from physicsnemo.models.fno import FNO
 
 from . import common
 
@@ -158,6 +158,14 @@ def test_fno_optims(device, dimension):
     # Check Combo
     model, invar = setup_model()
     assert common.validate_combo_optims(model, (invar,))
+
+    # Check fullgraph compilation
+    # run only on GPU
+    if device == "cuda:0":
+        model, invar = setup_model()
+        assert common.validate_torch_compile(
+            model, (invar,), fullgraph=True, error_on_recompile=True
+        )
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])

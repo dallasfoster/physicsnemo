@@ -14,55 +14,98 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
+from pytest_utils import import_or_fail
 
-from modulus.models.diffusion.preconditioning import (
-    EDMPrecondSRV2,
+from physicsnemo.models.diffusion.preconditioning import (
+    EDMPrecond,
+    EDMPrecondSR,
+    EDMPrecondSuperResolution,
     VEPrecond_dfsr,
     VEPrecond_dfsr_cond,
-    _ConditionalPrecond,
 )
-from modulus.models.module import Module
+from physicsnemo.models.module import Module
 
 
-def test__ConditionalPrecond():
-
+def test_EDMPrecondSuperResolution_forward():
     b, c_target, x, y = 1, 3, 8, 8
     c_cond = 4
 
-    def forward(x, sigma, *, class_labels):
-        assert x.shape[1] == c_target + c_cond
-        # add mean of full array and sigma, so that changing the scaling will
-        # break the regression check
-        return x[:, :c_target] + torch.mean(x, dim=1, keepdim=True) + sigma
-
-    preconditioned_model = _ConditionalPrecond(
-        model=forward, img_channels=c_target, img_resolution=8
+    # Create an instance of the preconditioner
+    model = EDMPrecondSuperResolution(
+        img_resolution=x,
+        img_in_channels=c_cond,
+        img_out_channels=c_target,
+        use_fp16=False,
+        model_type="SongUNet",
     )
 
     latents = torch.ones((b, c_target, x, y))
-    image_conditioning = torch.arange(b * c_cond * x * y).reshape((b, c_cond, x, y))
-    sigma = 10.0
-    output = preconditioned_model(
-        latents,
-        condition=image_conditioning,
-        sigma=preconditioned_model.round_sigma(sigma),
+    img_lr = torch.arange(b * c_cond * x * y).reshape((b, c_cond, x, y))
+    sigma = torch.tensor([10.0])
+
+    # Forward pass
+    output = model(
+        x=latents,
+        img_lr=img_lr,
+        sigma=sigma,
     )
-    assert output.shape == latents.shape
 
-    # this expected value is a regression check...if you have made an
-    # intentional change, feel free to change it
-    expected = 45.7331
-    assert torch.allclose(torch.tensor(expected), torch.max(output))
+    # Assert the output shape is correct
+    assert output.shape == (b, c_target, x, y)
 
 
-def test_EDMPrecondSRV2_serialization(tmp_path):
-    module = EDMPrecondSRV2(8, 1, 1)
-    assert isinstance(module, _ConditionalPrecond)
+@import_or_fail("termcolor")
+def test_EDMPrecondSuperResolution_serialization(tmp_path, pytestconfig):
+
+    from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
+
+    module = EDMPrecondSuperResolution(8, 1, 1)
     model_path = tmp_path / "output.mdlus"
     module.save(model_path.as_posix())
     loaded = Module.from_checkpoint(model_path.as_posix())
-    assert isinstance(loaded, EDMPrecondSRV2)
+    assert isinstance(loaded, EDMPrecondSuperResolution)
+    save_checkpoint(path=tmp_path, models=module, epoch=1)
+    epoch = load_checkpoint(path=tmp_path)
+    assert epoch == 1
+
+
+@pytest.mark.parametrize("channels", [[0, 4], [3, 8], [3, 5]])
+def test_EDMPrecond_forward(channels):
+    res = [32, 64]
+    cond_ch, out_ch = channels
+    b = 1
+
+    # Create an instance of the preconditioner
+    model = EDMPrecond(
+        img_resolution=res,
+        img_channels=99,  # dummy value, should be overwritten by following args
+        img_in_channels=out_ch + cond_ch,
+        img_out_channels=out_ch,
+        model_type="SongUNet",
+    )
+
+    latents = torch.randn(b, out_ch, *res)
+    sigma = torch.tensor([10.0])
+
+    if cond_ch > 0:
+        # Forward pass with conditioning
+        condition = torch.randn(b, cond_ch, *res)
+        output = model(
+            x=latents,
+            condition=condition,
+            sigma=sigma,
+        )
+    else:
+        # Forward pass without conditioning
+        output = model(
+            x=latents,
+            sigma=sigma,
+        )
+
+    # Assert the output shape is correct
+    assert output.shape == (b, out_ch, *res)
 
 
 def test_VEPrecond_dfsr():
@@ -137,3 +180,81 @@ def test_voriticity_residual_method():
     )
 
     assert xt.size() == dx_t.size()
+
+
+def test_EDMPrecondSuperResolution_amp_mode():
+    """Test EDMPrecondSuperResolution amp_mode property"""
+
+    res, cin, cout = 8, 1, 1
+    model = EDMPrecondSuperResolution(
+        img_resolution=res,
+        img_in_channels=cin,
+        img_out_channels=cout,
+        model_type="SongUNet",
+    )
+
+    # Default value should be False
+    assert model.amp_mode in {None, False}
+
+    # Enable amp_mode and verify propagation
+    model.amp_mode = True
+    assert model.amp_mode is True
+    if hasattr(model.model, "amp_mode"):
+        assert model.model.amp_mode is True
+    for sub in model.model.modules():
+        if hasattr(sub, "amp_mode"):
+            assert sub.amp_mode is True
+
+    # Disable again and verify
+    model.amp_mode = False
+    assert model.amp_mode is False
+    if hasattr(model.model, "amp_mode"):
+        assert model.model.amp_mode is False
+    for sub in model.model.modules():
+        if hasattr(sub, "amp_mode"):
+            assert sub.amp_mode is False
+
+
+def test_EDMPrecondSR_forward():
+    b, c_target, x, y = 1, 3, 8, 8
+    c_cond = 4
+
+    # Create an instance of the preconditioner
+    model = EDMPrecondSR(
+        img_resolution=x,
+        img_channels=c_target,  # This is not used but required for backward compatibility
+        img_in_channels=c_cond,
+        img_out_channels=c_target,
+        use_fp16=False,
+        model_type="SongUNet",
+    )
+
+    latents = torch.ones((b, c_target, x, y))
+    img_lr = torch.arange(b * c_cond * x * y).reshape((b, c_cond, x, y))
+    sigma = torch.tensor([10.0])
+
+    # Forward pass
+    output = model(
+        x=latents,
+        img_lr=img_lr,
+        sigma=sigma,
+    )
+
+    # Assert the output shape is correct
+    assert output.shape == (b, c_target, x, y)
+
+
+@import_or_fail("termcolor")
+def test_EDMPrecondSR_serialization(tmp_path, pytestconfig):
+    from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
+
+    module = EDMPrecondSR(
+        8, 1, 1, 1
+    )  # img_resolution, img_channels, img_in_channels, img_out_channels
+    model_path = tmp_path / "output.mdlus"
+    module.save(model_path.as_posix())
+    loaded = Module.from_checkpoint(model_path.as_posix())
+    assert isinstance(loaded, EDMPrecondSR)
+    save_checkpoint(path=tmp_path, models=module, epoch=1)
+    epoch = load_checkpoint(path=tmp_path)
+    assert epoch == 1
