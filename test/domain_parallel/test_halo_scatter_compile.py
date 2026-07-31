@@ -23,7 +23,17 @@ harness (``torchrun`` + ``distributed_mesh``); the correction needs at least two
 ranks to have any halo, so single-rank runs are skipped.
 """
 
+import contextlib
 import os
+
+# Per-rank, node-local Triton compile cache. The nvshmem_triton backend JIT-compiles its
+# device kernels on every rank at once; the default shared (networked-home) cache races on
+# the same artifact files -> ``OSError: [Errno 116] Stale file handle``. Isolate per rank on
+# /tmp before importing anything that pulls in triton (``RANK`` is set by torchrun).
+os.environ.setdefault(
+    "TRITON_CACHE_DIR",
+    f"/tmp/triton_cache_{os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0'))}",  # noqa: S108
+)
 
 import pytest
 import torch
@@ -47,6 +57,20 @@ def _ring_routing(rank: int, world_size: int, n_owned: int, lend: int):
     send_sizes = [[0] * world_size for _ in range(world_size)]
     for i in range(world_size):
         send_sizes[i][(i + 1) % world_size] = lend
+    n_ghost = sum(send_sizes[i][rank] for i in range(world_size))
+    return n_owned, n_owned + n_ghost, send_indices, send_sizes
+
+
+def _dense_routing(rank: int, world_size: int, n_owned: int, lend: int):
+    r"""Dense all-to-all halo: each rank lends its first ``lend`` owned rows to *every*
+    other rank and borrows ``lend`` ghost rows from each. Unlike the directed ring (one
+    neighbour), this gives ``world_size - 1`` sources per exchange -- so it exercises the
+    multi-neighbour single-kernel overlapped pull (``n_src > 1``), the regime that path
+    targets. Non-degenerate for any ``world_size >= 2``."""
+    send_indices = [list(range(lend)) if j != rank else [] for j in range(world_size)]
+    send_sizes = [
+        [lend if j != i else 0 for j in range(world_size)] for i in range(world_size)
+    ]
     n_ghost = sum(send_sizes[i][rank] for i in range(world_size))
     return n_owned, n_owned + n_ghost, send_indices, send_sizes
 
@@ -305,10 +329,8 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     ref_fwd = fn(pf, routing)
     (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
 
-    # symm-mem, eager: identical arithmetic (float64 accumulate), only the transport
-    # differs, so equality is exact. Repeat many times: the per-neighbour signal fences
-    # are the one place a mis-ordered put/wait would show up, and that race is
-    # nondeterministic -- a single pass can pass by luck.
+    # symm-mem, eager: identical float64 arithmetic, only the transport differs, so equality is
+    # exact. Repeat many times to surface any nondeterministic ordering race in the fences.
     _force_halo_backend("symm_mem")
     try:
         for _ in range(50):
@@ -320,15 +342,12 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     finally:
         _force_halo_backend(None)
 
-    # Auto-selection (no env override) picks symm-mem here: NVSHMEM if present, else the
-    # cached CUDA-IPC rendezvous probe succeeded. Exercises the broadened capability
-    # check, not just the forced path above.
+    # Auto-selection (no env override) also picks symm-mem here.
     from physicsnemo.domain_parallel.shard_utils.halo_scatter import select_halo_backend
 
     assert select_halo_backend(mesh).name == "symm_mem"
 
-    # symm-mem, compiled (the op body reads the backend env at runtime, so it survives
-    # tracing): must lower and match the oracle.
+    # symm-mem, compiled: the op body reads the backend env at runtime, so it survives tracing.
     _force_halo_backend("symm_mem")
     try:
         torch._dynamo.reset()
@@ -349,3 +368,211 @@ def test_halo_scatter_symm_mem_equivalence_1d(distributed_mesh, backend):
     if not _symm_mem_capable(distributed_mesh):
         pytest.skip("symmetric memory (>=2 P2P/NVSHMEM GPUs) not available")
     run_symm_mem_equivalence(distributed_mesh, backend)
+
+
+def _nvshmem_triton_capable(mesh):
+    r"""True when the cross-node NVSHMEM-Triton backend can serve this mesh: CUDA, >=2
+    ranks, NVSHMEM available, and the ``@requires_nvshmem`` getmem kernel builds (device
+    ``.bc`` locatable). Local (non-collective) so it cannot hang; homogeneous hardware ->
+    same verdict on every rank. Works intra-node too (NVSHMEM spans a single node), so the
+    equivalence can be exercised on a multi-GPU box, not only cross-node."""
+    if not torch.cuda.is_available() or mesh.size() < 2:
+        return False
+    from physicsnemo.domain_parallel.shard_utils import halo_scatter as hs
+
+    if not hs._HAS_NVSHMEM_TRITON:
+        return False
+    try:
+        import torch.distributed._symmetric_memory as sm
+
+        if not sm.is_nvshmem_available():
+            return False
+        with torch.cuda.device(DistributedManager().device):
+            return hs._nvshmem_get_launchable() is not None
+    except Exception:
+        return False
+
+
+def run_nvshmem_triton_equivalence(
+    mesh, backend, routing_fn=_ring_routing, n_owned=6, lend=2, feat=4
+):
+    r"""The cross-node NVSHMEM-Triton transport (device-initiated getmem) must match the
+    funcol oracle bitwise (fwd+bwd), eager and compiled -- same float64 arithmetic, only
+    the transport differs. Mirrors :func:`run_symm_mem_equivalence`. ``routing_fn`` selects
+    the halo topology (ring = 1 neighbour; dense = ``world_size - 1``, which exercises the
+    multi-neighbour single-kernel overlapped pull)."""
+    import torch.distributed._symmetric_memory as sm
+
+    from physicsnemo.domain_parallel.shard_utils.halo_scatter import (
+        _group_is_multinode,
+        select_halo_backend,
+    )
+
+    device = DistributedManager().device
+    group = mesh.get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    n_owned, n_padded, send_indices, send_sizes = routing_fn(
+        rank, world_size, n_owned, lend
+    )
+    routing = pack_halo_routing(
+        send_indices, send_sizes, n_owned, rank, world_size, device=device
+    )
+    torch.manual_seed(100 + rank)
+    padded0 = torch.randn(n_padded, feat, dtype=torch.float64, device=device)
+
+    def fn(p, r):
+        return halo_scatter_correct(p, r, group=mesh)
+
+    # funcol oracle (eager fwd+bwd).
+    _force_halo_backend("funcol")
+    pf = padded0.clone().requires_grad_(True)
+    ref_fwd = fn(pf, routing)
+    (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
+
+    # nvshmem-triton, eager: identical arithmetic, only the transport (device getmem +
+    # host-barrier readiness) differs, so equality is exact. Loop to surface any
+    # buffer-reuse / barrier-ordering bug across the cached symmetric buffers. Restore the
+    # default (CUDA/IPC) symm-mem backend afterwards so a later symm-mem test is unaffected
+    # by the process-wide set_backend("NVSHMEM") this path performs.
+    _force_halo_backend("nvshmem_triton")
+    try:
+        for _ in range(50):
+            ps = padded0.clone().requires_grad_(True)
+            nt_fwd = fn(ps, routing)
+            (nt_grad,) = torch.autograd.grad(nt_fwd.sum(), ps)
+            torch.testing.assert_close(nt_fwd, ref_fwd, rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(nt_grad, ref_grad, rtol=1e-12, atol=1e-12)
+    finally:
+        _force_halo_backend(None)
+
+    # Auto-selection: a multi-node group picks nvshmem-triton (single-node prefers symm-mem).
+    if _group_is_multinode(mesh):
+        assert select_halo_backend(mesh).name == "nvshmem_triton"
+
+    # nvshmem-triton, compiled (backend read at runtime inside the opaque op).
+    _force_halo_backend("nvshmem_triton")
+    try:
+        torch._dynamo.reset()
+        pc = padded0.clone().requires_grad_(True)
+        cf = torch.compile(fn, backend=backend, fullgraph=True)
+        out_c = cf(pc, routing)
+        (grad_c,) = torch.autograd.grad(out_c.sum(), pc)
+    finally:
+        _force_halo_backend(None)
+        with contextlib.suppress(Exception):
+            sm.set_backend(
+                "CUDA"
+            )  # best-effort restore of the default symm-mem backend
+    torch.testing.assert_close(out_c, ref_fwd, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(grad_c, ref_grad, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+# ring (1 neighbour) + dense (world-1 neighbours, feat 256) covers both the single-source
+# path and the multi-neighbour single-kernel overlapped pull at a bandwidth-relevant width.
+@pytest.mark.parametrize(
+    "topo,feat", [("ring", 4), ("dense", 256)], ids=["ring", "dense256"]
+)
+def test_halo_scatter_nvshmem_triton_equivalence_1d(
+    distributed_mesh, backend, topo, feat
+):
+    if not _nvshmem_triton_capable(distributed_mesh):
+        pytest.skip("NVSHMEM + Triton device API (>=2 GPUs) not available")
+    # The symm-mem backend is process-wide, so if the symm_mem test locked CUDA/IPC first
+    # (intra-node) NVSHMEM cannot be selected in this process; skip cleanly in that case.
+    from physicsnemo.domain_parallel.shard_utils.halo_scatter import (
+        reset_nvshmem_halo_state,
+    )
+
+    routing_fn = _ring_routing if topo == "ring" else _dense_routing
+    try:
+        run_nvshmem_triton_equivalence(
+            distributed_mesh, backend, routing_fn=routing_fn, feat=feat
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "locked to a different backend" in msg or "can not be changed" in msg:
+            pytest.skip(f"symm-mem backend already locked to non-NVSHMEM: {msg}")
+        raise
+    finally:
+        # Coordinated free of the cached symmetric buffers while the runtime is still live
+        # (all ranks reach this together) -- avoids the NVSHMEM teardown-order segfault at
+        # uncoordinated interpreter exit.
+        reset_nvshmem_halo_state()
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+def test_halo_scatter_nvshmem_triton_overlap_dense_1d(distributed_mesh):
+    r"""The opt-in single-kernel overlapped pull (``PHYSICSNEMO_HALO_NVSHMEM_OVERLAP=1``:
+    one kernel posts all ``getmem_nbi`` then one ``quiet``) must also match the funcol oracle
+    bitwise. Dense routing (``world_size - 1`` sources) exercises the multi-neighbour loop --
+    the case the overlap targets. This guards correctness of the overlap path even though it
+    is off by default (it is slower than blocking on the ``ibrc`` fabric, see the backend's
+    ``_nvshmem_overlap_enabled``)."""
+    if not _nvshmem_triton_capable(distributed_mesh):
+        pytest.skip("NVSHMEM + Triton device API (>=2 GPUs) not available")
+    from physicsnemo.domain_parallel.shard_utils import halo_scatter as hs
+
+    if not hs._HAS_NVSHMEM_OVERLAP:
+        pytest.skip("getmem_nbi_block / quiet not available in this torch")
+
+    prev = os.environ.get("PHYSICSNEMO_HALO_NVSHMEM_OVERLAP")
+    os.environ["PHYSICSNEMO_HALO_NVSHMEM_OVERLAP"] = "1"
+    try:
+        run_nvshmem_triton_equivalence(
+            distributed_mesh, "aot_eager", routing_fn=_dense_routing, feat=64
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "locked to a different backend" in msg or "can not be changed" in msg:
+            pytest.skip(f"symm-mem backend already locked to non-NVSHMEM: {msg}")
+        raise
+    finally:
+        if prev is None:
+            os.environ.pop("PHYSICSNEMO_HALO_NVSHMEM_OVERLAP", None)
+        else:
+            os.environ["PHYSICSNEMO_HALO_NVSHMEM_OVERLAP"] = prev
+        hs.reset_nvshmem_halo_state()
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("topo", ["ring", "dense"])
+def test_halo_scatter_nvshmem_triton_flags_1d(distributed_mesh, topo):
+    r"""The opt-in barrier-free readiness path (``PHYSICSNEMO_HALO_NVSHMEM_FLAGS=1``: device
+    flags -- READY producer->consumer, DONE consumer->producer, monotonic seq -- replace the
+    host ``dist.barrier``s) must match the funcol oracle bitwise, fwd+bwd. Runs ring (1
+    neighbour: simplest READY/DONE) and dense (``world_size - 1`` readers+sources: the full
+    multi-peer handshake, and the reuse-safety DONE waits). The equivalence's 50x eager loop
+    is the barrier-free repeated-exchange stress test."""
+    if not _nvshmem_triton_capable(distributed_mesh):
+        pytest.skip("NVSHMEM + Triton device API (>=2 GPUs) not available")
+    from physicsnemo.domain_parallel.shard_utils import halo_scatter as hs
+
+    if not hs._HAS_NVSHMEM_FLAGS:
+        pytest.skip("putmem_block / signal_wait_until not available in this torch")
+
+    routing_fn = _ring_routing if topo == "ring" else _dense_routing
+    feat = 4 if topo == "ring" else 64
+    prev = os.environ.get("PHYSICSNEMO_HALO_NVSHMEM_FLAGS")
+    os.environ["PHYSICSNEMO_HALO_NVSHMEM_FLAGS"] = "1"
+    try:
+        run_nvshmem_triton_equivalence(
+            distributed_mesh, "aot_eager", routing_fn=routing_fn, feat=feat
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "locked to a different backend" in msg or "can not be changed" in msg:
+            pytest.skip(f"symm-mem backend already locked to non-NVSHMEM: {msg}")
+        raise
+    finally:
+        if prev is None:
+            os.environ.pop("PHYSICSNEMO_HALO_NVSHMEM_FLAGS", None)
+        else:
+            os.environ["PHYSICSNEMO_HALO_NVSHMEM_FLAGS"] = prev
+        hs.reset_nvshmem_halo_state()
