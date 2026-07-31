@@ -172,8 +172,7 @@ def _worker_inductor_lowering(rank: int, world_size: int) -> None:
 
 
 def _worker_recompile(rank: int, world_size: int) -> None:
-    """A routing VALUE change (same shape) must NOT recompile -- the P0 property
-    that makes the correction survive graph breaks. Routing rides as a graph-input
+    """A routing value change (same shape) must not recompile: routing rides as a graph-input
     tensor, so only its shape is guarded, not its values."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29694"
@@ -288,8 +287,7 @@ def test_halo_scatter_correct_inductor_lowering_2ranks() -> None:
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
 def test_halo_scatter_correct_no_recompile_on_routing_change_2ranks() -> None:
-    """A routing value change (same shape) does not recompile (P0: graph-break
-    survival)."""
+    """A routing value change (same shape) does not recompile."""
     mp.spawn(_worker_recompile, args=(2,), nprocs=2)
 
 
@@ -318,11 +316,8 @@ def _make_halo_shard_tensor(padded, mesh, routing, world_size):
     from physicsnemo.domain_parallel import ShardTensor
     from physicsnemo.domain_parallel.shard_tensor import ShardTensorSpec
 
-    # A halo-padded local ([owned | ghost]) does not tile the mesh global: the
-    # ghost rows overlap peers' owned rows, so an honest Shard(0) spec (global =
-    # world x padded) makes AOT insert cross-rank redistributes for the local
-    # scatter. Mirror the local-honest plumbing spec (Replicate, global == local,
-    # cross-rank routing owned by the halo op), so autograd stays purely local.
+    # A halo-padded local ([owned | ghost]) does not tile the mesh global, so use a
+    # local-honest spec (Replicate, global == local) to keep autograd purely local.
     spec = ShardTensorSpec(
         mesh=mesh,
         placements=(Replicate(),) * mesh.ndim,
@@ -436,6 +431,101 @@ def test_halo_shard_tensor_scatter_add_2ranks(backend: str) -> None:
     mp.spawn(_worker_dispatch, args=(2, backend), nprocs=2)
 
 
+def _worker_inplace_dispatch(
+    rank: int, world_size: int, opname: str, backend: str
+) -> None:
+    """A halo ShardTensor's in-place ``scatter_add_`` / ``index_add_`` is corrected, eager and
+    under compile: the returned value matches the plain-funcol reference (fwd+bwd) and the
+    accumulator is mutated in place to the corrected values."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29696"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    try:
+        from torch.distributed.device_mesh import DeviceMesh
+
+        from physicsnemo.domain_parallel.shard_utils.halo_scatter import (
+            halo_forward_exchange,
+            halo_reverse_exchange,
+            pack_halo_routing,
+            register_halo_scatter_handlers,
+        )
+
+        register_halo_scatter_handlers()
+        mesh = DeviceMesh("cpu", list(range(world_size)), mesh_dim_names=("dom",))
+        n_owned, n_padded, send_indices, send_sizes = _ring_routing(rank)
+        feat = 4
+        send_idx_t = [torch.tensor(s, dtype=torch.int64) for s in send_indices]
+        routing = pack_halo_routing(send_indices, send_sizes, n_owned, rank, world_size)
+
+        torch.manual_seed(100 + rank)
+        src0 = torch.randn(n_padded, feat, dtype=torch.float64)
+
+        # Reference: identity accumulate into a zero accumulator, then the halo correction.
+        # ``scatter_add_`` (full-shape arange index) and ``index_add_`` (1-D arange index)
+        # both reduce to identity-into-zeros here, so they share the reference.
+        plain = _plain_correct_fn(halo_forward_exchange, halo_reverse_exchange)(
+            n_owned, send_idx_t, send_sizes, rank, world_size, mesh
+        )
+        ref_fwd = plain(src0)
+        ref_grad = plain(torch.ones_like(src0))
+        assert not torch.allclose(ref_fwd, src0), "correction is a no-op here"
+
+        idx = (
+            torch.arange(n_padded).unsqueeze(-1).expand(-1, feat)
+            if opname == "scatter_add_"
+            else torch.arange(n_padded)
+        )
+
+        def fn(agg, index, source):
+            return getattr(agg, opname)(0, index, source)
+
+        src_e = src0.clone().requires_grad_(True)
+        agg_e = _make_halo_shard_tensor(
+            torch.zeros(n_padded, feat, dtype=torch.float64), mesh, routing, world_size
+        )
+        out_e = fn(agg_e, idx, src_e)
+        # Returned value: corrected + autograd-connected back to the plain source.
+        (grad_e,) = torch.autograd.grad(out_e.to_local().sum(), src_e)
+        torch.testing.assert_close(out_e._local_tensor, ref_fwd, rtol=1e-9, atol=1e-9)
+        torch.testing.assert_close(grad_e, ref_grad, rtol=1e-9, atol=1e-9)
+        # In-place semantics: the accumulator itself now holds the corrected values.
+        torch.testing.assert_close(agg_e._local_tensor, ref_fwd, rtol=1e-9, atol=1e-9)
+
+        # Compiled: the in-place correction must survive the traced graph -- both the
+        # returned (differentiable) value and the in-place mutation of the accumulator.
+        torch._dynamo.reset()
+        src_c = src0.clone().requires_grad_(True)
+        agg_c = _make_halo_shard_tensor(
+            torch.zeros(n_padded, feat, dtype=torch.float64), mesh, routing, world_size
+        )
+        cf = torch.compile(fn, backend=backend, fullgraph=True)
+        out_c = cf(agg_c, idx, src_c)
+        assert torch.allclose(out_c.to_local().detach(), ref_fwd, rtol=1e-6, atol=1e-6)
+        (grad_c,) = torch.autograd.grad(out_c.to_local().sum(), src_c)
+        assert type(grad_c) is torch.Tensor, f"compiled grad is {type(grad_c)}"
+        torch.testing.assert_close(grad_c, ref_grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            agg_c.to_local().detach(), ref_fwd, rtol=1e-6, atol=1e-6
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend required")
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+@pytest.mark.parametrize("opname", ["scatter_add_", "index_add_"])
+def test_halo_shard_tensor_scatter_add_inplace_2ranks(
+    opname: str, backend: str
+) -> None:
+    """The in-place ``scatter_add_`` / ``index_add_`` on a halo ShardTensor is corrected --
+    eager and under ``torch.compile`` (aot_eager + inductor) -- with the return value matching
+    the funcol reference (fwd+bwd) and the accumulator mutated in place to the corrected
+    values."""
+    mp.spawn(_worker_inplace_dispatch, args=(2, opname, backend), nprocs=2)
+
+
 def test_select_halo_backend_env_override(monkeypatch) -> None:
     """Backend selection: funcol by default, honours the env override, and forcing
     the symm-mem backend on a CPU tensor surfaces a clear error at first use."""
@@ -463,3 +553,37 @@ def test_select_halo_backend_env_override(monkeypatch) -> None:
     monkeypatch.setenv("PHYSICSNEMO_HALO_BACKEND", "bogus")
     with pytest.raises(ValueError):
         hs.select_halo_backend()
+
+
+def test_pack_halo_routing_fixed_cap() -> None:
+    """``cap`` pads the packed routing to a constant length regardless of how many rows a
+    rank lends (fixed-shape routing for a compiled ``dynamic=False`` MD loop), and
+    ``_unpack_halo_routing`` recovers it exactly, ignoring the trailing pad."""
+    from physicsnemo.domain_parallel.shard_utils.halo_scatter import (
+        _unpack_halo_routing,
+        pack_halo_routing,
+    )
+
+    ws, n_owned, rank, cap = 3, 10, 1, 8
+    # rank 1 lends rows [0, 1] to rank 0 and [2] to rank 2 (total 3 <= cap).
+    send_indices = [[0, 1], [], [2]]
+    send_sizes = [[0, 0, 0], [2, 0, 1], [0, 0, 0]]
+
+    r = pack_halo_routing(send_indices, send_sizes, n_owned, rank, ws, cap=cap)
+    assert r.numel() == 4 + ws * ws + ws + cap  # fixed length
+
+    # A different lend pattern (different total) keeps the SAME packed shape -> no recompile.
+    r2 = pack_halo_routing(
+        [[0], [], []], [[0, 0, 0], [1, 0, 0], [0, 0, 0]], n_owned, rank, ws, cap=cap
+    )
+    assert r2.shape == r.shape
+
+    # Unpack recovers the routing exactly; the trailing pad (index-0 zeros) is not read.
+    si, ssz, no, rk, w = _unpack_halo_routing(r)
+    assert (no, rk, w) == (n_owned, rank, ws)
+    assert ssz == send_sizes
+    assert [t.tolist() for t in si] == send_indices
+
+    # cap smaller than the real index count is a clear error, not silent truncation.
+    with pytest.raises(ValueError, match="cap"):
+        pack_halo_routing(send_indices, send_sizes, n_owned, rank, ws, cap=2)
