@@ -15,6 +15,9 @@
 # limitations under the License.
 
 
+import os
+import sys
+
 import pytest
 
 from physicsnemo.distributed import DistributedManager
@@ -82,8 +85,19 @@ def distributed_mesh_2d(request):
     yield mesh
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
-    """Called after whole test run finished, right before returning exit status"""
+    """Called after whole test run finished, right before returning exit status.
 
+    ``trylast`` so the terminal reporter's pass/fail summary prints before this runs.
+    """
     if DistributedManager.is_initialized():
         DistributedManager.cleanup()
+
+    # Opt-in hard exit (PHYSICSNEMO_TEST_FAST_EXIT=1): exit immediately after the coordinated
+    # cleanup and the printed summary, skipping interpreter-shutdown teardown that some backends
+    # fault in. It preserves the real pass/fail and is inert unless the env var is set.
+    if os.environ.get("PHYSICSNEMO_TEST_FAST_EXIT") == "1":
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exitstatus)
